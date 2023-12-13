@@ -61,7 +61,7 @@ class FourierFilter(nn.Module):
         mask = self.get_mask(H, W // 2 + 1).to(x.device)
         # print(x[0].shape, self.mask.shape, self.mask.sum(), weight.shape)
         weight = torch.zeros_like(x[0]).masked_scatter(mask, weight)
-        x = x * weight
+        x = x * (1 + weight)
         x = torch.fft.irfft2(x, s=(H, W), norm="ortho")
         return x
 
@@ -124,7 +124,7 @@ class SepConv(nn.Module):
         x2 = self.filter(x2)
         x2 = self.pool(x2)
 
-        x = x1 * (1 + x2)
+        x = x1 * x2
         x = self.act2(x)
         x = self.pwconv2(x)
         return x
@@ -147,7 +147,8 @@ class FCBInvertedResidual(InvertedResidual):
         super().__init__(in_chs, out_chs, dw_kernel_size, stride, dilation, group_size, pad_type,
             noskip, exp_ratio, exp_kernel_size, pw_kernel_size, act_layer,
             norm_layer, se_layer, conv_kwargs, drop_path_rate)
-        if in_chs > 32:
+        self.fourier = True if self.has_skip else False
+        if self.fourier:
             exp_ratio *= 1.25
             norm_act_layer = get_norm_act_layer(norm_layer, act_layer)
             conv_kwargs = conv_kwargs or {}
@@ -167,9 +168,6 @@ class FCBInvertedResidual(InvertedResidual):
                 groups=mid_chs, bias=False,
             )
             self.filter = FourierFilter(mid_chs, 7, 4)
-            self.pool = (
-                nn.AvgPool2d(kernel_size=2, stride=2) if stride == 2 else nn.Identity()
-            )
             self.bn2 = norm_act_layer(mid_chs, inplace=True)
 
             # # Squeeze-and-excitation
@@ -178,7 +176,7 @@ class FCBInvertedResidual(InvertedResidual):
 
             # Point-wise linear projection
             self.conv_pwl = create_conv2d(mid_chs, out_chs, pw_kernel_size, padding=pad_type, **conv_kwargs)
-            self.bn3 = norm_act_layer(out_chs, apply_act=False)
+            self.bn3 = nn.Identity()
 
     def feature_info(self, location):
         if location == 'expansion':  # after SE, input to PWL
@@ -187,21 +185,20 @@ class FCBInvertedResidual(InvertedResidual):
             return dict(module='', hook_type='')
 
     def forward(self, x):
-        if not hasattr(self, "filter"):
+        if not self.fourier:
             return super().forward(x)
         shortcut = x
         x = self.conv_pw(x)
         x = self.bn1(x)
         x1, x2 = x.chunk(2, 1)
         x1 = self.conv_dw(x1)
-        x2 = self.pool(self.filter(x2))
-        x = x1 * (1 + x2)
+        x2 = self.filter(x2)
+        x = x1 * x2
         x = self.bn2(x)
         x = self.se(x)
         x = self.conv_pwl(x)
         x = self.bn3(x)
-        if self.has_skip:
-            x = self.drop_path(x) + shortcut
+        x = self.drop_path(x) + shortcut
         return x
 
 
@@ -387,6 +384,17 @@ class MobileNetV3(nn.Module):
         self.classifier = Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
         efficientnet_init_weights(self)
+        self.apply(self._init_weights)
+
+    @torch.jit.ignore
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
 
     def as_sequential(self):
         layers = [self.conv_stem, self.bn1]

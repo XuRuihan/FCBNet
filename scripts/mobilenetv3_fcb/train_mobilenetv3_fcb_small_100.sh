@@ -1,10 +1,10 @@
-DATA_PATH=/disk2/xrh/datasets/imagenet1k
+DATA_PATH=/disk4/imagenet1k/
 CODE_PATH=./ # modify code path here
 
 
 ALL_BATCH_SIZE=4096
 NUM_GPU=4
-GRAD_ACCUM_STEPS=4 # Adjust according to your GPU numbers and memory size.
+GRAD_ACCUM_STEPS=2 # Adjust according to your GPU numbers and memory size.
 let BATCH_SIZE=ALL_BATCH_SIZE/NUM_GPU/GRAD_ACCUM_STEPS
 MASTER_PORT=29502
 

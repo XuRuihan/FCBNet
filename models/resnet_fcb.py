@@ -212,6 +212,7 @@ class BasicBlock(nn.Module):
         aa_layer=None,
         drop_block=None,
         drop_path=None,
+        feature_resolution=7,
     ):
         super(BasicBlock, self).__init__()
 
@@ -238,13 +239,17 @@ class BasicBlock(nn.Module):
             aa_layer, channels=first_planes, stride=stride, enable=use_aa
         )
 
-        self.conv2 = nn.Conv2d(
-            first_planes,
-            outplanes,
-            kernel_size=3,
-            padding=dilation,
-            dilation=dilation,
-            bias=False,
+        # self.conv2 = nn.Conv2d(
+        #     first_planes,
+        #     outplanes,
+        #     kernel_size=3,
+        #     padding=dilation,
+        #     dilation=dilation,
+        #     bias=False,
+        # )
+        assert first_planes == outplanes
+        self.conv2 = SepConv(
+            outplanes, feature_resolution=feature_resolution // stride
         )
         self.bn2 = norm_layer(outplanes)
 
@@ -1165,7 +1170,8 @@ def resnext101_64x4d(pretrained=False, **kwargs):
 
 
 if __name__ == "__main__":
-    net = resnet50()
+    # net = resnet50()
+    net = resnet18()
     x = torch.rand(2, 3, 224, 224)
     y = net(x)
     print(y.shape)
