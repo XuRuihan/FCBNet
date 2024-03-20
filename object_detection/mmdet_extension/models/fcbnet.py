@@ -10,6 +10,10 @@ from torch import Tensor
 from timm.models.layers import trunc_normal_, DropPath, to_2tuple
 from timm.models.registry import register_model
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from mmengine.model import BaseModule
+from mmcv.cnn import build_norm_layer
+
+from mmdet.registry import MODELS
 
 
 def _cfg(url="", **kwargs):
@@ -238,14 +242,53 @@ class FourierFilter(nn.Module):
         mask = mask < self.kernel_size / 2 + 0.1
         return mask
 
+    # # Nothing
+    # @torch.amp.autocast("cuda", enabled=False)
+    # def forward(self, x: torch.Tensor):
+    #     B, C, H, W = x.shape
+
+    #     # x = F.interpolate(x, (self.height, self.height), mode="bilinear")
+    #     x = torch.fft.rfft2(x.float(), norm="ortho")
+    #     weight = torch.view_as_complex(self.complex_weight)
+    #     mask = self.get_mask(H, W // 2 + 1).to(x.device)
+    #     # print(x[0].shape, self.mask.shape, self.mask.sum(), weight.shape)
+    #     weight = torch.zeros_like(x[0]).masked_scatter(mask, weight)
+    #     x = x * (1 + weight)
+    #     x = torch.fft.irfft2(x, s=(H, W), norm="ortho")
+    #     # x = F.interpolate(x, (H, W), mode="bilinear")
+    #     return x
+
+    # # feature downsample
+    # # the scale has been changed either
+    # @torch.amp.autocast("cuda", enabled=False)
+    # def forward(self, x: torch.Tensor):
+    #     B, C, H, W = x.shape
+    #     resid = x
+    #     x = F.interpolate(x, (self.height, self.height), mode="bilinear")
+    #     x = torch.fft.rfft2(x.float(), norm="ortho")
+    #     weight = torch.view_as_complex(self.complex_weight)
+    #     weight = torch.zeros_like(x[0]).masked_scatter(self.mask, weight)
+    #     x = x * weight
+    #     x = torch.fft.irfft2(x, s=(H, W), norm="ortho")
+    #     x = F.interpolate(x, (H, W), mode="bilinear")
+    #     return x + resid
+
+    # kernel upsample
     @torch.amp.autocast("cuda", enabled=False)
     def forward(self, x: torch.Tensor):
         B, C, H, W = x.shape
-
         x = torch.fft.rfft2(x.float(), norm="ortho")
-        weight = torch.view_as_complex(self.complex_weight)
-        # print(x[0].shape, self.mask.shape, self.mask.sum(), weight.shape)
-        weight = torch.zeros_like(x[0]).masked_scatter(self.mask, weight)
+        weight = torch.zeros(
+            [1, C, self.height, self.width], dtype=x.dtype, device=x.device
+        )
+        weight = weight.masked_scatter(
+            self.mask, torch.view_as_complex(self.complex_weight)
+        )
+        weight = torch.view_as_real(weight)
+        weight = F.interpolate(
+            weight, (H, W // 2 + 1, 2), mode="trilinear", align_corners=True
+        )
+        weight = torch.view_as_complex(weight.squeeze(0))
         x = x * (1 + weight)
         x = torch.fft.irfft2(x, s=(H, W), norm="ortho")
         return x
@@ -269,6 +312,7 @@ class SepConv(nn.Module):
         feature_resolution=7,
         kernel_size=7,
         padding=3,
+        fc_kernel_size=7,
         **kwargs,
     ):
         super().__init__()
@@ -286,7 +330,10 @@ class SepConv(nn.Module):
             bias=bias,
         )  # depthwise conv
         self.filter = FourierFilter(
-            med_channels, feature_resolution, feature_resolution // 2 + 1
+            med_channels,
+            feature_resolution,
+            feature_resolution // 2 + 1,
+            fc_kernel_size,
         )
 
         self.act2 = act2_layer()
@@ -391,12 +438,16 @@ class MetaFormerBlock(nn.Module):
         drop_path=0.0,
         layer_scale_init_value=None,
         res_scale_init_value=None,
+        fc_kernel_size=7,
     ):
         super().__init__()
 
         self.norm1 = norm_layer(dim)
         self.token_mixer = token_mixer(
-            dim=dim, drop=drop, feature_resolution=feature_resolution
+            dim=dim,
+            drop=drop,
+            feature_resolution=feature_resolution,
+            fc_kernel_size=fc_kernel_size,
         )
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.layer_scale1 = (
@@ -440,31 +491,28 @@ downsamplings for the last 3 stages is a layer of conv with k3, s2 and p1
 DOWNSAMPLE_LAYERS_FOUR_STAGES format: [Downsampling, Downsampling, Downsampling, Downsampling]
 use `partial` to specify some arguments
 """
-DOWNSAMPLE_LAYERS_FOUR_STAGES = (
-    [
-        partial(
-            Downsampling,
-            kernel_size=7,
-            stride=4,
-            padding=2,
-            post_norm=partial(LayerNormGeneral, bias=False, eps=1e-6),
-        )
-    ]
-    + [
-        partial(
-            Downsampling,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            pre_norm=partial(LayerNormGeneral, bias=False, eps=1e-6),
-            pre_permute=True,
-        )
-    ]
-    * 3
-)
+DOWNSAMPLE_LAYERS_FOUR_STAGES = [
+    partial(
+        Downsampling,
+        kernel_size=7,
+        stride=4,
+        padding=2,
+        post_norm=partial(LayerNormGeneral, bias=False, eps=1e-6),
+    )
+] + [
+    partial(
+        Downsampling,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+        pre_norm=partial(LayerNormGeneral, bias=False, eps=1e-6),
+        pre_permute=True,
+    )
+] * 3
 
 
-class MetaFormer(nn.Module):
+@MODELS.register_module()
+class MetaFormer(BaseModule):
     r"""MetaFormer
         A PyTorch impl of : `MetaFormer Baselines for Vision`  -
           https://arxiv.org/abs/2210.13452
@@ -492,23 +540,26 @@ class MetaFormer(nn.Module):
         self,
         in_chans=3,
         num_classes=1000,
-        depths=[2, 2, 6, 2],
+        depths=[3, 3, 9, 3],
         dims=[64, 128, 320, 512],
         downsample_layers=DOWNSAMPLE_LAYERS_FOUR_STAGES,
-        token_mixers=nn.Identity,
+        token_mixers=SepConv,
         feature_resolutions=[56, 28, 14, 7],
         mlps=Mlp,
         norm_layers=partial(LayerNormGeneral, eps=1e-6, bias=False),
         drop_path_rate=0.0,
-        head_dropout=0.0,
         layer_scale_init_values=None,
         res_scale_init_values=[None, None, 1.0, 1.0],
-        output_norm=partial(nn.LayerNorm, eps=1e-6),
-        head_fn=nn.Linear,
+        out_indices=(0, 1, 2, 3),
+        init_cfg=None,
+        norm_cfg=None,
+        fc_kernel_size=7,
         **kwargs,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.out_indices = out_indices
+        self.init_cfg = init_cfg
 
         if not isinstance(depths, (list, tuple)):
             depths = [depths]  # it means the model has only one stage
@@ -551,6 +602,7 @@ class MetaFormer(nn.Module):
             nn.ModuleList()
         )  # each stage consists of multiple metaformer blocks
         cur = 0
+        self.norms = nn.ModuleList()
         for i in range(num_stage):
             stage = nn.Sequential(
                 *[
@@ -563,19 +615,17 @@ class MetaFormer(nn.Module):
                         drop_path=dp_rates[cur + j],
                         layer_scale_init_value=layer_scale_init_values[i],
                         res_scale_init_value=res_scale_init_values[i],
+                        fc_kernel_size=fc_kernel_size,
                     )
                     for j in range(depths[i])
                 ]
             )
             self.stages.append(stage)
             cur += depths[i]
-
-        self.norm = output_norm(dims[-1])
-
-        if head_dropout > 0.0:
-            self.head = head_fn(dims[-1], num_classes, head_dropout=head_dropout)
-        else:
-            self.head = head_fn(dims[-1], num_classes)
+            if i in out_indices:
+                self.norms.append(LayerNormGeneral(dims[i], eps=1e-6, bias=False))
+                # self.norms.append(nn.LayerNorm(dims[i], 1e-6))
+                # self.norms.append(build_norm_layer(norm_cfg, dims[i])[1])
 
         self.apply(self._init_weights)
 
@@ -590,33 +640,18 @@ class MetaFormer(nn.Module):
         return {"norm"}
 
     def forward_features(self, x):
+        outs = []
         for i in range(self.num_stage):
             x = self.downsample_layers[i](x)
             x = self.stages[i](x)
-        return self.norm(x.mean([1, 2]))  # (B, H, W, C) -> (B, C)
+            if i in self.out_indices:
+                outs.append(self.norms[i](x).permute(0, 3, 1, 2))
+                # outs.append(x.permute(0, 3, 1, 2))
+        return tuple(outs)
 
     def forward(self, x):
         x = self.forward_features(x)
-        x = self.head(x)
         return x
-
-
-@register_model
-def fcbnet_s12(pretrained=False, **kwargs):
-    model = MetaFormer(
-        depths=[2, 2, 6, 2],
-        dims=[32, 64, 160, 256],
-        token_mixers=SepConv,
-        head_fn=MlpHead,
-        **kwargs,
-    )
-    model.default_cfg = default_cfgs["convformer_s18"]
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url=model.default_cfg["url"], map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(state_dict)
-    return model
 
 
 @register_model
@@ -628,7 +663,7 @@ def fcbnet_s18(pretrained=False, **kwargs):
         head_fn=MlpHead,
         **kwargs,
     )
-    model.default_cfg = default_cfgs["convformer_s18"]
+    model.default_cfg = default_cfgs["convformer_s36"]
     if pretrained:
         state_dict = torch.hub.load_state_dict_from_url(
             url=model.default_cfg["url"], map_location="cpu", check_hash=True
@@ -655,27 +690,10 @@ def fcbnet_s36(pretrained=False, **kwargs):
     return model
 
 
-@register_model
-def fcbnet_m36(pretrained=False, **kwargs):
-    model = MetaFormer(
-        depths=[3, 12, 18, 3],
-        dims=[96, 192, 384, 576],
-        token_mixers=SepConv,
-        head_fn=MlpHead,
-        **kwargs,
-    )
-    model.default_cfg = default_cfgs["convformer_m36"]
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url=model.default_cfg["url"], map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(state_dict)
-    return model
-
-
 if __name__ == "__main__":
+    # net = resnet50()
     net = fcbnet_s18()
-    x = torch.rand(2, 3, 224, 224)
-    # print(net)
-    y = net(x)
-    print(y.shape)
+    x = torch.rand(2, 3, 512, 512)
+    outs = net(x)
+    for y in outs:
+        print(y.shape)
