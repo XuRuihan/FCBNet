@@ -1,6 +1,6 @@
 # FCBNet: Improving Convolutional Neural Networks with Fourier Convolution Block
 
-This repo is the official PyTorch implementation of **FCBNet** proposed by our paper "ParCNetV2: Oversized Kernel with Enhanced Attention (to be released)".
+This repo is the official PyTorch implementation of **FCBNet** proposed by our paper "Improving Convolutional Neural Networks with Fourier Convolution Block (to be released)".
 
 
 ## Introduction
@@ -63,7 +63,7 @@ train.py $DATA_PATH \
 --model fcbnet_s18 --opt adamw --lr 4e-3 --warmup-epochs 20 \
 -b $BATCH_SIZE --grad-accum-steps $GRAD_ACCUM_STEPS \
 --drop-path 0.2 --head-dropout 0.0 \
-> log/parcnetv2_tiny.log 2>&1
+> log/fcbnet_s18.log 2>&1
 ```
 Training scripts of other models are shown in [scripts](/scripts/).
 
